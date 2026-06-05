@@ -1,0 +1,434 @@
+#include <WiFi.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <SPI.h>
+#include <time.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite sprite = TFT_eSprite(&tft);
+
+
+
+// ── WiFi ──────────────────────────────────────
+const char* ssid     = "AirFiber-Oodae6";
+const char* password = "seod3joo1Oozae6m";
+
+// ── NTP ───────────────────────────────────────
+const char* ntpServer     = "pool.ntp.org";
+const long  gmtOffset_sec = 19800;
+const int   daylightOffset = 0;
+
+// ── Weather API ───────────────────────────────
+const char* apiKey  = "e356e5d2f7a56c796f22bc12c870c029";
+const char* city    = "Thrissur";
+const char* country = "IN";
+
+// ── Weather Data ──────────────────────────────
+float  w_temp     = 0;
+float  w_feels    = 0;
+int    w_humidity = 0;
+float  w_wind     = 0;
+String w_desc     = "Loading...";
+String w_main     = "Clear";
+int    w_pressure = 0;
+unsigned long lastWeatherFetch = 0;
+#define WEATHER_INTERVAL 600000
+
+// ── Screen state ──────────────────────────────
+int currentScreen = 0;
+unsigned long lastTouch = 0;
+#define TOUCH_DEBOUNCE 600
+
+// ── Animation ─────────────────────────────────
+float colonAlpha = 1.0, colonDir = -0.05;
+float glowPulse  = 0.0;
+int   lastDay    = -1;
+
+// ── Colors ────────────────────────────────────
+#define BG   0x0000
+#define S_BG 0x0000
+uint16_t C_BRIGHT, C_GLOW, C_WHITE, C_DIM, C_RED,
+         C_ORANGE, C_PURPLE, C_ACCENT, C_GREEN, C_YELLOW;
+
+void initColors() {
+  C_BRIGHT = tft.color565(0,   255, 200);
+  C_GLOW   = tft.color565(80,   20, 120);
+  C_WHITE  = tft.color565(220, 225, 230);
+  C_DIM    = tft.color565(100, 110, 120);
+  C_RED    = tft.color565(255, 100, 120);
+  C_ORANGE = tft.color565(255, 180,  60);
+  C_PURPLE = tft.color565(150,  80, 200);
+  C_ACCENT = tft.color565(100, 200, 255);
+  C_GREEN  = tft.color565( 80, 220, 120);
+  C_YELLOW = tft.color565(255, 220,  60);
+}
+
+uint16_t blendColors(uint16_t c1, uint16_t c2, float a) {
+  uint8_t r1=(c1>>11)&0x1F, g1=(c1>>5)&0x3F, b1=c1&0x1F;
+  uint8_t r2=(c2>>11)&0x1F, g2=(c2>>5)&0x3F, b2=c2&0x1F;
+  return tft.color565(
+    (uint8_t)(r1*(1-a)+r2*a)*8,
+    (uint8_t)(g1*(1-a)+g2*a)*4,
+    (uint8_t)(b1*(1-a)+b2*a)*8);
+}
+
+void drawGradientBG(TFT_eSprite& s) {
+  for (int y = 0; y < 240; y++) {
+    float r = (float)y / 240.0;
+    s.drawFastHLine(0, y, 320,
+      blendColors(tft.color565(10,15,40), tft.color565(5,5,15), r));
+  }
+}
+
+uint16_t weatherColor() {
+  if (w_main == "Clear")        return C_YELLOW;
+  if (w_main == "Clouds")       return C_ACCENT;
+  if (w_main == "Rain")         return tft.color565(80,160,255);
+  if (w_main == "Thunderstorm") return C_PURPLE;
+  if (w_main == "Drizzle")      return C_ACCENT;
+  if (w_main == "Snow")         return C_WHITE;
+  if (w_main == "Mist" || w_main == "Haze") return C_DIM;
+  return C_BRIGHT;
+}
+
+String weatherLabel() {
+  if (w_main == "Clear")        return "SUNNY";
+  if (w_main == "Clouds")       return "CLOUDY";
+  if (w_main == "Rain")         return "RAINY";
+  if (w_main == "Thunderstorm") return "STORM";
+  if (w_main == "Drizzle")      return "DRIZZLE";
+  if (w_main == "Snow")         return "SNOW";
+  if (w_main == "Mist")         return "MISTY";
+  if (w_main == "Haze")         return "HAZY";
+  return "---";
+}
+
+void fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String url = "http://api.openweathermap.org/data/2.5/weather?q=" +
+               String(city) + "," + String(country) +
+               "&appid=" + String(apiKey) + "&units=metric";
+  http.begin(url);
+  if (http.GET() == 200) {
+    DynamicJsonDocument doc(2048);
+    deserializeJson(doc, http.getString());
+    w_temp     = doc["main"]["temp"];
+    w_feels    = doc["main"]["feels_like"];
+    w_humidity = doc["main"]["humidity"];
+    w_wind     = doc["wind"]["speed"];
+    w_pressure = doc["main"]["pressure"];
+    w_desc     = doc["weather"][0]["description"].as<String>();
+    w_main     = doc["weather"][0]["main"].as<String>();
+    w_desc[0]  = toupper(w_desc[0]);
+  }
+  http.end();
+}
+
+void showSplash(const char* l1, const char* l2) {
+  tft.fillScreen(BG);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(C_BRIGHT, BG);
+  tft.drawString("DESK CLOCK", 160, 80, 4);
+  tft.setTextColor(C_WHITE, BG);
+  tft.drawString(l1, 160, 130, 2);
+  tft.setTextColor(C_DIM, BG);
+  tft.drawString(l2, 160, 158, 2);
+  tft.setTextColor(C_DIM, BG);
+  tft.drawString("Tap screen to switch views", 160, 210, 1);
+}
+
+// ── Nav dots helper ───────────────────────────
+void drawNavDots(TFT_eSprite& s, int active) {
+  int cx = 160, y = 233;
+  for (int i = 0; i < 3; i++) {
+    int x = cx - 12 + i * 12;
+    if (i == active) s.fillCircle(x, y, 4, C_BRIGHT);
+    else             s.drawCircle(x, y, 4, C_DIM);
+  }
+}
+
+// ── SCREEN 0: Clock ───────────────────────────
+void drawClock(struct tm& t) {
+  drawGradientBG(sprite);
+
+  int LP=60, RP=68, RX=320-RP;
+  int CX=LP+(RX-LP)/2, CY=108;
+
+  sprite.drawFastVLine(LP, 0, 240, C_PURPLE);
+  sprite.drawFastVLine(RX, 0, 240, C_PURPLE);
+
+  // Days
+  const char* dayNames[]={"MON","TUE","WED","THU","FRI","SAT","SUN"};
+  int activeIdx=(t.tm_wday==0)?6:t.tm_wday-1;
+  int slotH=240/7;
+  for(int i=0;i<7;i++){
+    int yMid=i*slotH+slotH/2;
+    if(i==activeIdx){
+      sprite.fillRect(2,i*slotH+2,LP-4,slotH-4,tft.color565(80,0,30));
+      sprite.setTextColor(C_RED,tft.color565(80,0,30));
+    } else {
+      sprite.setTextColor(C_DIM,S_BG);
+    }
+    sprite.setTextDatum(MC_DATUM);
+    sprite.drawString(dayNames[i],LP/2,yMid,2);
+  }
+
+  // Right panel
+  int RC=RX+RP/2;
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString("DATE",RC,13,1);
+  char dayNum[4],monBuf[8],yrBuf[6];
+  strftime(dayNum,sizeof(dayNum),"%d",&t);
+  strftime(monBuf,sizeof(monBuf),"%b",&t);
+  strftime(yrBuf,sizeof(yrBuf),"%Y",&t);
+  sprite.setTextColor(C_ACCENT,S_BG);
+  sprite.drawString(dayNum,RC,35,4);
+  sprite.setTextColor(C_BRIGHT,S_BG);
+  sprite.drawString(monBuf,RC,60,2);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString(yrBuf,RC,77,1);
+  sprite.drawFastHLine(RX+5,92,RP-10,C_PURPLE);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString("WTHR",RC,103,1);
+  char tempStr[8];
+  sprintf(tempStr,"%.0f",w_temp);
+  sprite.setTextColor(weatherColor(),S_BG);
+  sprite.drawString(tempStr,RC,126,4);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString("oC",RC,112,1);
+  sprite.setTextColor(weatherColor(),S_BG);
+  sprite.drawString(weatherLabel().substring(0,4).c_str(),RC,150,1);
+  sprite.drawFastHLine(RX+5,160,RP-10,C_PURPLE);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString("KERALA",RC,174,1);
+  sprite.drawString("IST",RC,188,1);
+
+  // Time
+  colonAlpha+=colonDir;
+  if(colonAlpha<=0.1) colonDir=0.05;
+  if(colonAlpha>=1.0) colonDir=-0.05;
+  char timeBuf[8];
+  strftime(timeBuf,sizeof(timeBuf),colonAlpha>0.3?"%I:%M":"%I %M",&t);
+  glowPulse+=0.05; if(glowPulse>1.0) glowPulse=0.0;
+
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(blendColors(C_GLOW,BG,0.7),S_BG);
+  sprite.drawString(timeBuf,CX-2,CY+2,7);
+  sprite.drawString(timeBuf,CX+2,CY-2,7);
+  sprite.setTextColor(blendColors(C_PURPLE,BG,0.5),S_BG);
+  sprite.drawString(timeBuf,CX-1,CY+1,7);
+  sprite.drawString(timeBuf,CX+1,CY-1,7);
+  sprite.setTextColor(C_BRIGHT,S_BG);
+  sprite.drawString(timeBuf,CX,CY,7);
+
+  char ampm[4];
+  strftime(ampm,sizeof(ampm),"%p",&t);
+  sprite.setTextDatum(ML_DATUM);
+  sprite.setTextColor(blendColors(C_BRIGHT,C_PURPLE,0.3),S_BG);
+  sprite.drawString(ampm,CX+76,CY-32,2);
+
+  char secBuf[4];
+  strftime(secBuf,sizeof(secBuf),"%S",&t);
+  sprite.setTextDatum(MC_DATUM);
+  float breathe=0.7+0.3*sin(glowPulse*3.14159);
+  sprite.setTextColor(blendColors(C_WHITE,C_DIM,1.0-breathe),S_BG);
+  sprite.drawString(secBuf,CX,CY+50,4);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString("SEC",CX,CY+68,1);
+
+  // Progress bar
+  int barX=LP+8,barW=RX-LP-16,barY=218;
+  int filled=(t.tm_sec*barW)/60;
+  sprite.fillRoundRect(barX,barY,barW,5,2,blendColors(C_DIM,BG,0.5));
+  for(int i=0;i<filled;i++){
+    float ratio=(float)i/barW;
+    sprite.drawFastVLine(barX+i,barY,5,blendColors(C_ACCENT,C_BRIGHT,ratio));
+  }
+
+  drawNavDots(sprite, 0);
+  sprite.pushSprite(0,0);
+}
+
+// ── SCREEN 1: Weather ─────────────────────────
+void drawWeather(struct tm& t) {
+  drawGradientBG(sprite);
+  uint16_t wCol=weatherColor();
+
+  sprite.fillRect(0,0,320,32,tft.color565(10,10,35));
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(C_BRIGHT,tft.color565(10,10,35));
+  sprite.drawString("WEATHER - THRISSUR",160,16,2);
+  sprite.drawFastHLine(0,32,320,C_PURPLE);
+
+  sprite.setTextColor(wCol,S_BG);
+  sprite.drawString(weatherLabel().c_str(),100,70,4);
+  char tempStr[10];
+  sprintf(tempStr,"%.1f",w_temp);
+  sprite.setTextDatum(MR_DATUM);
+  sprite.setTextColor(wCol,S_BG);
+  sprite.drawString(tempStr,245,80,6);
+  sprite.setTextDatum(ML_DATUM);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString("oC",248,58,2);
+
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(C_WHITE,S_BG);
+  sprite.drawString(w_desc.c_str(),160,118,2);
+  sprite.drawFastHLine(10,132,300,C_PURPLE);
+
+  int boxW=70,boxH=52,boxY=142;
+  int bx[4]={8,86,164,242};
+  const char* lbl[]={"FEELS","HUMID","WIND","PRES"};
+  char vals[4][12];
+  sprintf(vals[0],"%.1f",w_feels);
+  sprintf(vals[1],"%d%%",w_humidity);
+  sprintf(vals[2],"%.1fm/s",w_wind);
+  sprintf(vals[3],"%dhPa",w_pressure);
+  uint16_t bc[]={C_ORANGE,tft.color565(80,200,255),C_GREEN,C_PURPLE};
+
+  for(int i=0;i<4;i++){
+    sprite.drawRoundRect(bx[i],boxY,boxW,boxH,6,bc[i]);
+    sprite.setTextDatum(MC_DATUM);
+    sprite.setTextColor(C_DIM,S_BG);
+    sprite.drawString(lbl[i],bx[i]+boxW/2,boxY+14,1);
+    sprite.setTextColor(bc[i],S_BG);
+    sprite.drawString(vals[i],bx[i]+boxW/2,boxY+33,1);
+  }
+
+  sprite.drawFastHLine(10,200,300,C_PURPLE);
+  char updBuf[32];
+  strftime(updBuf,sizeof(updBuf),"Updated: %H:%M",&t);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString(updBuf,160,212,1);
+
+  drawNavDots(sprite, 1);
+  sprite.pushSprite(0,0);
+}
+
+// ── SCREEN 2: Calendar ────────────────────────
+void drawCalendar(struct tm& t) {
+  drawGradientBG(sprite);
+
+  sprite.fillRect(0,0,320,32,tft.color565(10,10,35));
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(C_BRIGHT,tft.color565(10,10,35));
+  char calTitle[20];
+  strftime(calTitle,sizeof(calTitle),"%B  %Y",&t);
+  sprite.drawString(calTitle,160,16,2);
+  sprite.drawFastHLine(0,32,320,C_PURPLE);
+
+  const char* hdrs[]={"MON","TUE","WED","THU","FRI","SAT","SUN"};
+  int colW=320/7;
+  for(int i=0;i<7;i++){
+    sprite.setTextColor(i>=5?C_RED:C_DIM,S_BG);
+    sprite.drawString(hdrs[i],i*colW+colW/2,44,1);
+  }
+  sprite.drawFastHLine(0,53,320,C_PURPLE);
+
+  struct tm first=t; first.tm_mday=1; mktime(&first);
+  int startCol=(first.tm_wday==0)?6:first.tm_wday-1;
+
+  int month=t.tm_mon, year=t.tm_year+1900, dim;
+  if(month==1) dim=(year%4==0&&(year%100!=0||year%400==0))?29:28;
+  else if(month==3||month==5||month==8||month==10) dim=30;
+  else dim=31;
+
+  int col=startCol, row=0, rowH=26;
+  for(int d=1;d<=dim;d++){
+    int cx2=col*colW+colW/2, cy2=64+row*rowH;
+    if(d==t.tm_mday){
+      sprite.fillCircle(cx2,cy2,11,C_BRIGHT);
+      sprite.setTextColor(BG,C_BRIGHT);
+    } else if(col>=5){
+      sprite.setTextColor(C_RED,S_BG);
+    } else {
+      sprite.setTextColor(C_WHITE,S_BG);
+    }
+    sprite.setTextDatum(MC_DATUM);
+    char ds[4]; sprintf(ds,"%d",d);
+    sprite.drawString(ds,cx2,cy2,2);
+    if(++col>=7){col=0;row++;}
+  }
+
+  sprite.drawFastHLine(0,218,320,C_PURPLE);
+  char tb[16]; strftime(tb,sizeof(tb),"%I:%M:%S %p",&t);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString(tb,160,226,1);
+
+  drawNavDots(sprite, 2);
+  sprite.pushSprite(0,0);
+}
+
+// ── Setup ─────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  pinMode(21, INPUT_PULLUP);
+  delay(1000);
+
+  tft.init();
+  tft.setRotation(3);
+   tft.invertDisplay(false);
+  tft.fillScreen(BG);
+  initColors();
+
+  sprite.setColorDepth(16);
+  sprite.createSprite(320, 240);
+
+  showSplash("Connecting to WiFi...", ssid);
+  WiFi.begin(ssid, password);
+  int a=0;
+  while(WiFi.status()!=WL_CONNECTED && a<30){delay(500);a++;}
+
+  if(WiFi.status()==WL_CONNECTED){
+    showSplash("Syncing NTP time...","pool.ntp.org");
+    configTime(gmtOffset_sec,daylightOffset,ntpServer);
+    struct tm ti; int tr=0;
+    while(!getLocalTime(&ti)&&tr<20){delay(500);tr++;}
+    showSplash("Fetching weather...","Thrissur, Kerala");
+    fetchWeather();
+    lastWeatherFetch=millis();
+  } else {
+    showSplash("WiFi Failed!","Check credentials");
+    delay(3000);
+  }
+
+  tft.fillScreen(BG);
+
+}
+// ── Loop ──────────────────────────────────────
+void loop() {
+  struct tm t;
+  if(!getLocalTime(&t)){delay(50);return;}
+
+ // Button on IO21 — press to switch screen
+  static bool lastBtnState = HIGH;
+  bool btnState = digitalRead(21);
+  
+  if(btnState == LOW && lastBtnState == HIGH){
+    unsigned long now = millis();
+    if(now - lastTouch > TOUCH_DEBOUNCE){
+      lastTouch = now;
+      currentScreen = (currentScreen + 1) % 3;
+      Serial.printf("Button! screen=%d\n", currentScreen);
+      if(currentScreen == 1) fetchWeather();
+    }
+  }
+  lastBtnState = btnState;
+  // Weather refresh
+  if(millis()-lastWeatherFetch>WEATHER_INTERVAL){
+    lastWeatherFetch=millis();
+    fetchWeather();
+  }
+
+  switch(currentScreen){
+    case 0: drawClock(t);    break;
+    case 1: drawWeather(t);  break;
+    case 2: drawCalendar(t); break;
+  }
+
+  delay(50);
+}
