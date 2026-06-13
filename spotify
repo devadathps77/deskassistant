@@ -1,0 +1,614 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <TFT_eSPI.h>
+#include <JPEGDEC.h>
+#include <time.h>
+#include <base64.h>
+
+TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite sprite = TFT_eSprite(&tft);
+TFT_eSprite artSprite = TFT_eSprite(&tft); // for album art
+JPEGDEC jpeg;
+WebServer server(80);
+
+// ── WiFi ──────────────────────────────────────
+const char* ssid     = "AirFiber-Oodae6";
+const char* password = "seod3joo1Oozae6m";
+
+// ── Spotify Credentials ───────────────────────
+const char* clientId     = "b4b4fc14357944cf9fc4db6a581df5eb";
+const char* clientSecret = "7f7063d2e9be4a1e94e2e3cb1f16761d";
+const char* redirectUri  = "https://parmesan-unimpeded-taekwondo.ngrok-free.dev/callback";
+
+// ── Spotify State ─────────────────────────────
+String accessToken  = "";
+String refreshToken = "";
+unsigned long tokenExpiry = 0;
+
+String sp_track    = "Not Playing";
+String sp_artist   = "---";
+String sp_album    = "---";
+String sp_artUrl   = "";
+String sp_prevArtUrl = "";
+bool   sp_playing  = false;
+int    sp_progress = 0;
+int    sp_duration = 1;
+int    sp_volume   = 0;
+
+unsigned long lastSpotifyFetch = 0;
+#define SPOTIFY_INTERVAL 3000
+
+// ── Lyrics State ──────────────────────────────
+struct LyricLine {
+  int   timeMs;
+  String text;
+};
+
+#define MAX_LYRICS 200
+LyricLine lyrics[MAX_LYRICS];
+int lyricCount   = 0;
+int currentLyric = 0;
+String prevTrackForLyrics = "";
+
+// ── Album Art Buffer ──────────────────────────
+uint8_t* artBuf    = nullptr;
+int      artBufLen = 0;
+bool     artLoaded = false;
+
+// ── Colors ────────────────────────────────────
+#define BG   0x0000
+#define S_BG 0x0000
+uint16_t C_BRIGHT, C_GLOW, C_WHITE, C_DIM, C_RED,
+         C_ORANGE, C_PURPLE, C_ACCENT, C_GREEN,
+         C_YELLOW, C_SPOTIFY, C_LYRIC_DIM;
+
+void initColors() {
+  C_BRIGHT    = tft.color565(0,   255, 200);
+  C_GLOW      = tft.color565(80,   20, 120);
+  C_WHITE     = tft.color565(220, 225, 230);
+  C_DIM       = tft.color565(100, 110, 120);
+  C_RED       = tft.color565(255, 100, 120);
+  C_ORANGE    = tft.color565(255, 180,  60);
+  C_PURPLE    = tft.color565(150,  80, 200);
+  C_ACCENT    = tft.color565(100, 200, 255);
+  C_GREEN     = tft.color565( 80, 220, 120);
+  C_YELLOW    = tft.color565(255, 220,  60);
+  C_SPOTIFY   = tft.color565( 30, 215,  96);
+  C_LYRIC_DIM = tft.color565( 60,  80,  70);
+}
+
+uint16_t blendColors(uint16_t c1, uint16_t c2, float a) {
+  uint8_t r1=(c1>>11)&0x1F, g1=(c1>>5)&0x3F, b1=c1&0x1F;
+  uint8_t r2=(c2>>11)&0x1F, g2=(c2>>5)&0x3F, b2=c2&0x1F;
+  return tft.color565(
+    (uint8_t)(r1*(1-a)+r2*a)*8,
+    (uint8_t)(g1*(1-a)+g2*a)*4,
+    (uint8_t)(b1*(1-a)+b2*a)*8);
+}
+
+void drawGradientBG(TFT_eSprite& s, int w, int h) {
+  for (int y=0; y<h; y++) {
+    float r=(float)y/h;
+    s.drawFastHLine(0,y,w,
+      blendColors(tft.color565(10,15,40),tft.color565(5,5,15),r));
+  }
+}
+
+// ── Splash ────────────────────────────────────
+void showSplash(const char* l1, const char* l2) {
+  tft.fillScreen(BG);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(C_SPOTIFY, BG);
+  tft.drawString("SPOTIFY REMOTE", 160, 80, 4);
+  tft.setTextColor(C_WHITE, BG);
+  tft.drawString(l1, 160, 130, 2);
+  tft.setTextColor(C_DIM, BG);
+  tft.drawString(l2, 160, 158, 2);
+}
+
+// ── Parse LRC timestamp ───────────────────────
+// Format: [mm:ss.xx]
+int parseLrcTime(String ts) {
+  // ts like "01:23.45"
+  int colon = ts.indexOf(':');
+  int dot   = ts.indexOf('.');
+  if(colon < 0) return 0;
+  int mins = ts.substring(0, colon).toInt();
+  int secs = ts.substring(colon+1, dot > 0 ? dot : ts.length()).toInt();
+  int ms   = dot > 0 ? ts.substring(dot+1).toInt() * 10 : 0;
+  return (mins * 60 + secs) * 1000 + ms;
+}
+
+// ── Fetch Lyrics from lrclib.net ──────────────
+void fetchLyrics(String track, String artist) {
+  if(track == prevTrackForLyrics) return;
+  prevTrackForLyrics = track;
+  lyricCount   = 0;
+  currentLyric = 0;
+
+  if(WiFi.status() != WL_CONNECTED) return;
+
+  // URL encode basic
+  track.replace(" ", "%20");
+  artist.replace(" ", "%20");
+
+  HTTPClient http;
+  String url = "https://lrclib.net/api/get?track_name=" + track +
+               "&artist_name=" + artist;
+  http.begin(url);
+  http.addHeader("User-Agent", "ESP32DeskClock/1.0");
+  int code = http.GET();
+
+  if(code == 200) {
+    DynamicJsonDocument doc(8192);
+    DeserializationError err = deserializeJson(doc, http.getString());
+    if(!err && doc.containsKey("syncedLyrics")) {
+      String lrc = doc["syncedLyrics"].as<String>();
+      // Parse LRC lines
+      int pos = 0;
+      while(pos < lrc.length() && lyricCount < MAX_LYRICS) {
+        int nl = lrc.indexOf('\n', pos);
+        if(nl < 0) nl = lrc.length();
+        String line = lrc.substring(pos, nl);
+        line.trim();
+
+        // Find timestamp [mm:ss.xx]
+        if(line.startsWith("[")) {
+          int close = line.indexOf(']');
+          if(close > 0) {
+            String ts   = line.substring(1, close);
+            String text = line.substring(close + 1);
+            text.trim();
+            // Skip lines with no text or metadata
+            if(text.length() > 0 && !ts.startsWith("ti:") &&
+               !ts.startsWith("ar:") && !ts.startsWith("al:")) {
+              lyrics[lyricCount].timeMs = parseLrcTime(ts);
+              // Trim long lines
+              if(text.length() > 38) text = text.substring(0, 36) + "..";
+              lyrics[lyricCount].text   = text;
+              lyricCount++;
+            }
+          }
+        }
+        pos = nl + 1;
+      }
+      Serial.printf("Lyrics loaded: %d lines\n", lyricCount);
+    } else {
+      Serial.println("No synced lyrics found");
+    }
+  }
+  http.end();
+}
+
+// ── Find current lyric index ──────────────────
+int findCurrentLyric(int progressMs) {
+  if(lyricCount == 0) return -1;
+  int idx = 0;
+  for(int i = 0; i < lyricCount; i++) {
+    if(lyrics[i].timeMs <= progressMs) idx = i;
+    else break;
+  }
+  return idx;
+}
+
+// ── JPEG draw callback ────────────────────────
+int jpegDraw(JPEGDRAW* pDraw) {
+  // Draw into artSprite at offset
+  for(int y = 0; y < pDraw->iHeight; y++) {
+    for(int x = 0; x < pDraw->iWidth; x++) {
+      artSprite.drawPixel(pDraw->x + x, pDraw->y + y,
+                          pDraw->pPixels[y * pDraw->iWidth + x]);
+    }
+  }
+  return 1;
+}
+
+// ── Fetch & decode album art ──────────────────
+void fetchAlbumArt(String url) {
+  if(url == "" || url == sp_prevArtUrl) return;
+  sp_prevArtUrl = url;
+  artLoaded = false;
+
+  if(WiFi.status() != WL_CONNECTED) return;
+
+  // Free old buffer
+  if(artBuf) { free(artBuf); artBuf = nullptr; }
+
+ HTTPClient http;
+  http.begin(url);
+  http.addHeader("User-Agent", "ESP32DeskClock/1.0");
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  int code = http.GET();
+  Serial.printf("Art fetch: %s → %d\n", url.c_str(), code);
+
+  if(code == 200) {
+    artBufLen = http.getSize();
+    if(artBufLen > 0 && artBufLen < 80000) {
+      artBuf = (uint8_t*)malloc(artBufLen);
+      if(artBuf) {
+        WiFiClient* stream = http.getStreamPtr();
+        stream->readBytes(artBuf, artBufLen);
+
+        // Decode JPEG into 60x60 sprite
+        artSprite.createSprite(60, 60);
+        if(jpeg.openRAM(artBuf, artBufLen, jpegDraw)) {
+          jpeg.decode(0, 0, JPEG_SCALE_QUARTER); // scale down to ~fit 60x60
+          jpeg.close();
+          artLoaded = true;
+          Serial.println("Album art loaded!");
+        }
+      }
+    }
+  }
+  http.end();
+}
+
+// ── Auth helpers ──────────────────────────────
+String buildAuthURL() {
+  return "https://accounts.spotify.com/authorize"
+         "?client_id=" + String(clientId) +
+         "&response_type=code"
+         "&redirect_uri=" + String(redirectUri) +
+         "&scope=user-read-playback-state%20user-modify-playback-state"
+         "&show_dialog=true";
+}
+
+bool exchangeCode(String code) {
+  HTTPClient http;
+  http.begin("https://accounts.spotify.com/api/token");
+  http.addHeader("Content-Type","application/x-www-form-urlencoded");
+  String auth = base64::encode(String(clientId)+":"+String(clientSecret));
+  http.addHeader("Authorization","Basic "+auth);
+  String body = "grant_type=authorization_code&code="+code+
+                "&redirect_uri="+String(redirectUri);
+  int c = http.POST(body);
+  if(c == 200) {
+    DynamicJsonDocument doc(2048);
+    deserializeJson(doc, http.getString());
+    accessToken  = doc["access_token"].as<String>();
+    refreshToken = doc["refresh_token"].as<String>();
+    tokenExpiry  = millis()+(doc["expires_in"].as<int>()*1000);
+    http.end(); return true;
+  }
+  http.end(); return false;
+}
+
+void refreshAccessToken() {
+  if(refreshToken=="") return;
+  HTTPClient http;
+  http.begin("https://accounts.spotify.com/api/token");
+  http.addHeader("Content-Type","application/x-www-form-urlencoded");
+  String auth=base64::encode(String(clientId)+":"+String(clientSecret));
+  http.addHeader("Authorization","Basic "+auth);
+  int c=http.POST("grant_type=refresh_token&refresh_token="+refreshToken);
+  if(c==200){
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc,http.getString());
+    accessToken=doc["access_token"].as<String>();
+    tokenExpiry=millis()+(doc["expires_in"].as<int>()*1000);
+  }
+  http.end();
+}
+
+void spotifyCommand(String ep, String method) {
+  if(accessToken=="") return;
+  if(millis()>tokenExpiry-60000) refreshAccessToken();
+  HTTPClient http;
+  http.begin("https://api.spotify.com/v1/me/player/"+ep);
+  http.addHeader("Authorization","Bearer "+accessToken);
+  if(method=="PUT"){
+    http.addHeader("Content-Length","0");
+    http.PUT("");
+  } else {
+    http.addHeader("Content-Length","0");
+    http.POST("");
+  }
+  http.end();
+}
+
+// ── Fetch playback ────────────────────────────
+void fetchPlayback() {
+  if(accessToken=="") return;
+  if(millis()>tokenExpiry-60000) refreshAccessToken();
+  HTTPClient http;
+  http.begin("https://api.spotify.com/v1/me/player");
+  http.addHeader("Authorization","Bearer "+accessToken);
+  int code=http.GET();
+  if(code==200) {
+    DynamicJsonDocument doc(8192);
+    deserializeJson(doc,http.getString());
+    sp_playing  = doc["is_playing"];
+    sp_progress = doc["progress_ms"];
+    sp_duration = doc["item"]["duration_ms"];
+    sp_volume   = doc["device"]["volume_percent"];
+
+    String newTrack  = doc["item"]["name"].as<String>();
+    String newArtist = doc["item"]["artists"][0]["name"].as<String>();
+    sp_album  = doc["item"]["album"]["name"].as<String>();
+
+    // Get album art URL (pick smallest image)
+    JsonArray images = doc["item"]["album"]["images"];
+    if(images.size() > 0) {
+      // Last image is usually smallest
+      sp_artUrl = images[images.size()-1]["url"].as<String>();
+    }
+
+    // Track changed?
+    if(newTrack != sp_track || newArtist != sp_artist) {
+      sp_track  = newTrack;
+      sp_artist = newArtist;
+      // Fetch new lyrics and art
+      fetchLyrics(sp_track, sp_artist);
+      fetchAlbumArt(sp_artUrl);
+    }
+
+    // Trim display strings
+    String dispTrack  = sp_track;
+    String dispArtist = sp_artist;
+    if(dispTrack.length()  > 20) dispTrack  = dispTrack.substring(0,18)+"..";
+    if(dispArtist.length() > 20) dispArtist = dispArtist.substring(0,18)+"..";
+
+  } else if(code==204) {
+    sp_track="Nothing Playing";
+    sp_artist="Open Spotify on phone";
+    sp_playing=false;
+  }
+  http.end();
+}
+
+// ── Draw Spotify Screen ───────────────────────
+void drawSpotify() {
+  drawGradientBG(sprite, 320, 240);
+
+  // ── Title bar ─────────────────────────────
+  sprite.fillRect(0,0,320,28,tft.color565(10,10,35));
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(C_SPOTIFY,tft.color565(10,10,35));
+  sprite.drawString("SPOTIFY REMOTE",160,14,2);
+  sprite.drawFastHLine(0,28,320,C_SPOTIFY);
+
+  // ── Album art (left, 60x60) ───────────────
+  if(artLoaded && artSprite.created()) {
+    artSprite.pushToSprite(&sprite, 8, 34);
+    sprite.drawRect(7,33,62,62,C_SPOTIFY); // border
+  } else {
+    // Placeholder
+    sprite.fillRect(8,34,60,60,tft.color565(20,40,30));
+    sprite.drawRect(7,33,62,62,C_SPOTIFY);
+    sprite.setTextColor(C_DIM,tft.color565(20,40,30));
+    sprite.setTextDatum(MC_DATUM);
+    sprite.drawString("ART",38,64,1);
+  }
+
+  // ── Track info (right of art) ─────────────
+  String dispTrack  = sp_track;
+  String dispArtist = sp_artist;
+  String dispAlbum  = sp_album;
+  if(dispTrack.length()  > 18) dispTrack  = dispTrack.substring(0,16)+"..";
+  if(dispArtist.length() > 20) dispArtist = dispArtist.substring(0,18)+"..";
+  if(dispAlbum.length()  > 20) dispAlbum  = dispAlbum.substring(0,18)+"..";
+
+  sprite.setTextDatum(ML_DATUM);
+  sprite.setTextColor(C_WHITE,  S_BG);
+  sprite.drawString(dispTrack.c_str(),  76, 46, 2);
+  sprite.setTextColor(C_SPOTIFY, S_BG);
+  sprite.drawString(dispArtist.c_str(), 76, 66, 1);
+  sprite.setTextColor(C_DIM,    S_BG);
+  sprite.drawString(dispAlbum.c_str(),  76, 78, 1);
+
+  // Playing indicator
+  sprite.setTextDatum(ML_DATUM);
+  sprite.setTextColor(sp_playing ? C_SPOTIFY : C_RED, S_BG);
+  sprite.drawString(sp_playing ? ">> PLAYING" : "|| PAUSED", 76, 92, 1);
+
+  // ── Progress bar ──────────────────────────
+  int barX=8, barW=304, barY=100;
+  int filled = sp_duration>0 ? (sp_progress*barW)/sp_duration : 0;
+  sprite.fillRoundRect(barX,barY,barW,4,2,tft.color565(40,40,60));
+  sprite.fillRoundRect(barX,barY,filled,4,2,C_SPOTIFY);
+
+  // Time stamps
+  char progStr[8], durStr[8];
+  sprintf(progStr,"%d:%02d",(sp_progress/1000)/60,(sp_progress/1000)%60);
+  sprintf(durStr, "%d:%02d",(sp_duration/1000)/60,(sp_duration/1000)%60);
+  sprite.setTextDatum(ML_DATUM);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString(progStr,barX,barY+10,1);
+  sprite.setTextDatum(MR_DATUM);
+  sprite.drawString(durStr,barX+barW,barY+10,1);
+
+  sprite.drawFastHLine(0,118,320,tft.color565(30,30,50));
+
+  // ── Lyrics section ────────────────────────
+  if(lyricCount > 0 && sp_playing) {
+    currentLyric = findCurrentLyric(sp_progress);
+
+    // Show 4 lines: prev-prev, prev, CURRENT, next
+    struct { int idx; int y; uint16_t color; int font; } lines[] = {
+      { currentLyric-2, 130, C_LYRIC_DIM,  1 },
+      { currentLyric-1, 148, C_DIM,        1 },
+      { currentLyric,   168, C_SPOTIFY,    2 }, // current — bright green, bigger
+      { currentLyric+1, 186, C_DIM,        1 },
+    };
+
+    for(auto& l : lines) {
+      if(l.idx >= 0 && l.idx < lyricCount) {
+        sprite.setTextDatum(MC_DATUM);
+        sprite.setTextColor(l.color, S_BG);
+        sprite.drawString(lyrics[l.idx].text.c_str(), 160, l.y, l.font);
+      }
+    }
+
+    // Lyric progress indicator
+    if(currentLyric+1 < lyricCount) {
+      int nextMs  = lyrics[currentLyric+1].timeMs;
+      int currMs  = lyrics[currentLyric].timeMs;
+      int spanMs  = nextMs - currMs;
+      int elapsed = sp_progress - currMs;
+      if(spanMs > 0) {
+        int lyrW = 200;
+        int lyrX = 60;
+        int lyrFill = constrain((elapsed*lyrW)/spanMs, 0, lyrW);
+        sprite.fillRoundRect(lyrX,200,lyrW,2,1,tft.color565(30,30,50));
+        sprite.fillRoundRect(lyrX,200,lyrFill,2,1,C_LYRIC_DIM);
+      }
+    }
+
+  } else if(lyricCount == 0) {
+    sprite.setTextDatum(MC_DATUM);
+    sprite.setTextColor(C_DIM,S_BG);
+    sprite.drawString("No lyrics available",160,160,1);
+    sprite.drawString("SHORT=Play/Pause",160,180,1);
+    sprite.drawString("DOUBLE=Next  LONG=Prev",160,196,1);
+  } else {
+    // Paused — show controls hint
+    sprite.setTextDatum(MC_DATUM);
+    sprite.setTextColor(C_DIM,S_BG);
+    sprite.drawString("|| PAUSED",160,155,2);
+    sprite.drawString("SHORT=Play/Pause",160,180,1);
+    sprite.drawString("DOUBLE=Next  LONG=Prev",160,196,1);
+  }
+
+  // ── Volume bar ────────────────────────────
+  sprite.drawFastHLine(0,208,320,tft.color565(30,30,50));
+  char volStr[12];
+  sprintf(volStr,"VOL %d%%",sp_volume);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.setTextDatum(ML_DATUM);
+  sprite.drawString(volStr,8,220,1);
+  // Volume bar
+  sprite.fillRoundRect(60,216,200,4,2,tft.color565(40,40,60));
+  sprite.fillRoundRect(60,216,(sp_volume*200)/100,4,2,C_SPOTIFY);
+
+  sprite.pushSprite(0,0);
+}
+
+// ── Web server handlers ───────────────────────
+void handleRoot() {
+  String html = "<html><body style='background:#000;color:#1DB954;"
+                "font-family:sans-serif;text-align:center;padding:50px'>"
+                "<h1>ESP32 Spotify Remote</h1>"
+                "<a href='" + buildAuthURL() + "' style='background:#1DB954;"
+                "color:#000;padding:15px 30px;border-radius:25px;"
+                "text-decoration:none;font-size:18px'>Connect Spotify</a>"
+                "</body></html>";
+  server.send(200,"text/html",html);
+}
+
+void handleCallback() {
+  if(server.hasArg("code")) {
+    String code=server.arg("code");
+    showSplash("Authorizing...","Please wait");
+    if(exchangeCode(code)) {
+      server.send(200,"text/html",
+        "<html><body style='background:#000;color:#1DB954;"
+        "font-family:sans-serif;text-align:center;padding:50px'>"
+        "<h1>Connected!</h1><p>Return to your ESP32.</p></body></html>");
+      showSplash("Connected!","Loading...");
+      delay(1000);
+    } else {
+      server.send(400,"text/plain","Auth failed");
+    }
+  }
+}
+
+void handlePlay()  {spotifyCommand("play","PUT");   server.send(200,"text/plain","OK");}
+void handlePause() {spotifyCommand("pause","PUT");  server.send(200,"text/plain","OK");}
+void handleNext()  {spotifyCommand("next","POST");  server.send(200,"text/plain","OK");}
+void handlePrev()  {spotifyCommand("previous","POST");server.send(200,"text/plain","OK");}
+
+// ── Setup ─────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  tft.init();
+  tft.setRotation(3);
+  tft.invertDisplay(false);
+  tft.fillScreen(BG);
+  initColors();
+
+  sprite.setColorDepth(16);
+  sprite.createSprite(320, 240);
+
+  pinMode(21, INPUT_PULLUP);
+
+  showSplash("Connecting to WiFi...", ssid);
+  WiFi.begin(ssid, password);
+  while(WiFi.status()!=WL_CONNECTED) delay(500);
+
+  server.on("/",         handleRoot);
+  server.on("/callback", handleCallback);
+  server.on("/play",     handlePlay);
+  server.on("/pause",    handlePause);
+  server.on("/next",     handleNext);
+  server.on("/previous", handlePrev);
+  server.begin();
+
+  tft.fillScreen(BG);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(C_SPOTIFY,BG);
+  tft.drawString("SPOTIFY SETUP",160,60,4);
+  tft.setTextColor(C_WHITE,BG);
+  tft.drawString("Open browser and go to:",160,100,2);
+  tft.setTextColor(C_ACCENT,BG);
+  tft.drawString("192.168.31.22",160,130,4);
+  tft.setTextColor(C_DIM,BG);
+  tft.drawString("Then click Connect Spotify",160,165,2);
+
+  Serial.println("Ready - go to http://192.168.31.22");
+}
+
+// ── Button handling ───────────────────────────
+unsigned long btnPressTime  = 0;
+bool          btnPressed    = false;
+unsigned long lastBtnRelease= 0;
+int           clickCount    = 0;
+#define LONG_PRESS  800
+#define DOUBLE_TIME 400
+
+void handleButton() {
+  bool btn=digitalRead(21);
+  if(btn==LOW && !btnPressed){
+    btnPressed=true;
+    btnPressTime=millis();
+  }
+  if(btn==HIGH && btnPressed){
+    btnPressed=false;
+    unsigned long dur=millis()-btnPressTime;
+    if(dur>LONG_PRESS){
+      spotifyCommand("previous","POST");
+      Serial.println("Prev");
+    } else {
+      clickCount++;
+      lastBtnRelease=millis();
+    }
+  }
+  if(clickCount>0 && millis()-lastBtnRelease>DOUBLE_TIME){
+    if(clickCount>=2){
+      spotifyCommand("next","POST");
+      Serial.println("Next");
+    } else {
+      if(sp_playing) spotifyCommand("pause","PUT");
+      else           spotifyCommand("play","PUT");
+      Serial.println("Play/Pause");
+    }
+    clickCount=0;
+  }
+}
+
+// ── Loop ──────────────────────────────────────
+void loop() {
+  server.handleClient();
+  handleButton();
+
+  if(accessToken!="" && millis()-lastSpotifyFetch>SPOTIFY_INTERVAL){
+    lastSpotifyFetch=millis();
+    fetchPlayback();
+    drawSpotify();
+  }
+
+  delay(20);
+}
