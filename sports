@@ -51,6 +51,8 @@ unsigned long lastF1Fetch = 0;
 #define F1_REFRESH_INTERVAL 10000
 String liveDriver[20];
 String liveGap[20];
+String livePosition[20];
+String liveStatus = "NO SESSION";
 String raceStatus = "GREEN";
 String sessionType = "RACE";
 int currentLap = 34;
@@ -568,24 +570,49 @@ void drawFootball(struct tm& t) {
 
 void fetchF1Live() {
 
-  const char* drv[20] = {
-    "VER","NOR","PIA","LEC","RUS",
-    "HAM","ALO","SAI","ALB","GAS",
-    "TSU","HUL","OCO","STR","LAW",
-    "BEA","BOR","ANT","COL","HAD"
-  };
+  HTTPClient http;
 
-  const char* gap[20] = {
-    "+0.000","+1.234","+3.456","+6.782","+8.911",
-    "+12.4","+15.8","+19.2","+23.1","+27.5",
-    "+31.2","+35.4","+39.7","+44.1","+48.8",
-    "+52.3","+57.0","+61.5","+67.2","+73.1"
-  };
+  http.begin("https://api.openf1.org/v1/drivers?session_key=latest");
 
-  for(int i=0;i<20;i++){
-    liveDriver[i]=drv[i];
-    liveGap[i]=gap[i];
+  int httpCode = http.GET();
+
+  Serial.print("OpenF1 HTTP: ");
+  Serial.println(httpCode);
+
+  if (httpCode == 200) {
+
+    String payload = http.getString();
+
+    Serial.println("OpenF1 Connected");
+
+    // TEMPORARY TEST
+   const char* drv[20] = {
+  "VER","NOR","PIA","LEC","RUS",
+  "HAM","ALO","SAI","ALB","GAS",
+  "TSU","HUL","OCO","STR","LAW",
+  "BEA","BOR","ANT","COL","HAD"
+};
+
+const char* gap[20] = {
+  "+0.000","+1.234","+3.456","+6.782","+8.911",
+  "+12.4","+15.8","+19.2","+23.1","+27.5",
+  "+31.2","+35.4","+39.7","+44.1","+48.8",
+  "+52.3","+57.0","+61.5","+67.2","+73.1"
+};
+
+for(int i=0;i<20;i++){
+  liveDriver[i] = drv[i];
+  liveGap[i] = gap[i];
+}
+
+    liveStatus = "CONNECTED";
+
+  } else {
+
+    liveStatus = "API ERROR";
   }
+
+  http.end();
 }
 void fetchF1Standings() {
 
@@ -680,6 +707,9 @@ void drawF1Live(struct tm& t) {
 
   sprite.setTextColor(TFT_GREEN, TFT_BLACK);
   sprite.drawString("LAP " + String(currentLap) + " / " + String(totalLaps), 10, 220, 2);
+
+sprite.setTextColor(TFT_GREEN, TFT_BLACK);
+sprite.drawString(liveStatus, 180, 220, 2);
 
   drawNavDots(sprite, 2);
 
