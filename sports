@@ -1,0 +1,881 @@
+
+// ════════════════════════════════════════════════════════════════
+//  Sports Desk Assistant  —  ESP32-S3 + ST7789 320×240
+//  Your original code + Football Screen (Screen 1) implemented
+// ════════════════════════════════════════════════════════════════
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>          // ← ADDED for HTTPS
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <SPI.h>
+#include <time.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite sprite = TFT_eSprite(&tft);
+
+// ── WiFi ──────────────────────────────────────
+const char* ssid     = "AirFiber-Oodae6";
+const char* password = "seod3joo1Oozae6m";
+
+// ── NTP ───────────────────────────────────────
+const char* ntpServer     = "pool.ntp.org";
+const long  gmtOffset_sec = 19800;
+const int   daylightOffset = 0;
+
+// ── Weather API ───────────────────────────────
+const char* apiKey  = "e356e5d2f7a56c796f22bc12c870c029";
+const char* city    = "Thrissur";
+const char* country = "IN";
+
+// ── Football API ──────────────────────────────  ← ADDED
+const char* FOOTBALL_KEY = "ce4374b6ed64437e83512e078cf9ebc8";
+
+// ── Weather Data ──────────────────────────────
+float  w_temp     = 0;
+float  w_feels    = 0;
+int    w_humidity = 0;
+float  w_wind     = 0;
+String w_desc     = "Loading...";
+String w_main     = "Clear";
+int    w_pressure = 0;
+unsigned long lastWeatherFetch = 0;
+#define WEATHER_INTERVAL 600000
+
+// F1 Data (your existing)
+String f1Driver[5];
+int f1Points[5];
+unsigned long lastF1Fetch = 0;
+#define F1_REFRESH_INTERVAL 10000
+String liveDriver[20];
+String liveGap[20];
+String raceStatus = "GREEN";
+String sessionType = "RACE";
+int currentLap = 34;
+int totalLaps = 70;
+unsigned long lastLiveFetch = 0;
+#define LIVE_REFRESH_INTERVAL 10000
+
+
+// ── Football Data ─────────────────────────────  ← ADDED BLOCK
+#define FOOTBALL_MAX 4
+
+struct FootballMatch {
+  char    home[13];
+  char    away[13];
+  int     homeScore;
+  int     awayScore;
+  char    status[8];   // "LIVE","HT","FT","45'","18:00","SOON"
+  bool    isLive;
+  bool    isFinished;
+};
+
+FootballMatch  fbMatches[FOOTBALL_MAX];
+int            fbMatchCount   = 0;
+char           fbCompName[22] = "FOOTBALL";
+bool           fbHasData      = false;
+unsigned long  lastFbFetch    = 0;
+// Live match = refresh every 60s, no match = every 5 min
+#define FB_INTERVAL_LIVE  60000UL
+#define FB_INTERVAL_IDLE 300000UL
+
+// Competitions tried in order — first one with matches today wins
+const char* FB_COMPS[] = { "WC",  "PL",              "CL",                "PD"      };
+const char* FB_NAMES[] = { "FIFA WORLD CUP", "PREMIER LEAGUE", "CHAMPIONS LEAGUE", "LA LIGA" };
+const int   FB_COMP_CNT = 4;
+
+// Shared HTTPS buffer — single allocation, reused every fetch
+#define HTTP_BUF 6144
+char httpBuf[HTTP_BUF];
+
+// ── Screen state ──────────────────────────────
+int currentScreen = 0;
+unsigned long lastTouch = 0;
+#define TOUCH_DEBOUNCE 600
+
+// ── Animation ─────────────────────────────────
+float colonAlpha = 1.0, colonDir = -0.05;
+float glowPulse  = 0.0;
+int   lastDay    = -1;
+
+// ── Colors ────────────────────────────────────
+#define BG   0x0000
+#define S_BG 0x0000
+uint16_t C_BRIGHT, C_GLOW, C_WHITE, C_DIM, C_RED,
+         C_ORANGE, C_PURPLE, C_ACCENT, C_GREEN, C_YELLOW;
+
+void initColors() {
+  C_BRIGHT = tft.color565(0,   255, 200);
+  C_GLOW   = tft.color565(80,   20, 120);
+  C_WHITE  = tft.color565(220, 225, 230);
+  C_DIM    = tft.color565(100, 110, 120);
+  C_RED    = tft.color565(255, 100, 120);
+  C_ORANGE = tft.color565(255, 180,  60);
+  C_PURPLE = tft.color565(150,  80, 200);
+  C_ACCENT = tft.color565(100, 200, 255);
+  C_GREEN  = tft.color565( 80, 220, 120);
+  C_YELLOW = tft.color565(255, 220,  60);
+}
+
+uint16_t blendColors(uint16_t c1, uint16_t c2, float a) {
+  uint8_t r1=(c1>>11)&0x1F, g1=(c1>>5)&0x3F, b1=c1&0x1F;
+  uint8_t r2=(c2>>11)&0x1F, g2=(c2>>5)&0x3F, b2=c2&0x1F;
+  return tft.color565(
+    (uint8_t)(r1*(1-a)+r2*a)*8,
+    (uint8_t)(g1*(1-a)+g2*a)*4,
+    (uint8_t)(b1*(1-a)+b2*a)*8);
+}
+
+void drawGradientBG(TFT_eSprite& s) {
+  for (int y = 0; y < 240; y++) {
+    float r = (float)y / 240.0;
+    s.drawFastHLine(0, y, 320,
+      blendColors(tft.color565(10,15,40), tft.color565(5,5,15), r));
+  }
+}
+
+uint16_t weatherColor() {
+  if (w_main == "Clear")        return C_YELLOW;
+  if (w_main == "Clouds")       return C_ACCENT;
+  if (w_main == "Rain")         return tft.color565(80,160,255);
+  if (w_main == "Thunderstorm") return C_PURPLE;
+  if (w_main == "Drizzle")      return C_ACCENT;
+  if (w_main == "Snow")         return C_WHITE;
+  if (w_main == "Mist" || w_main == "Haze") return C_DIM;
+  return C_BRIGHT;
+}
+
+String weatherLabel() {
+  if (w_main == "Clear")        return "SUNNY";
+  if (w_main == "Clouds")       return "CLOUDY";
+  if (w_main == "Rain")         return "RAINY";
+  if (w_main == "Thunderstorm") return "STORM";
+  if (w_main == "Drizzle")      return "DRIZZLE";
+  if (w_main == "Snow")         return "SNOW";
+  if (w_main == "Mist")         return "MISTY";
+  if (w_main == "Haze")         return "HAZY";
+  return "---";
+}
+
+void fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String url = "http://api.openweathermap.org/data/2.5/weather?q=" +
+               String(city) + "," + String(country) +
+               "&appid=" + String(apiKey) + "&units=metric";
+  http.begin(url);
+  if (http.GET() == 200) {
+    DynamicJsonDocument doc(2048);
+    deserializeJson(doc, http.getString());
+    w_temp     = doc["main"]["temp"];
+    w_feels    = doc["main"]["feels_like"];
+    w_humidity = doc["main"]["humidity"];
+    w_wind     = doc["wind"]["speed"];
+    w_pressure = doc["main"]["pressure"];
+    w_desc     = doc["weather"][0]["description"].as<String>();
+    w_main     = doc["weather"][0]["main"].as<String>();
+    w_desc[0]  = toupper(w_desc[0]);
+  }
+  http.end();
+}
+
+void showSplash(const char* l1, const char* l2) {
+  tft.fillScreen(BG);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(C_BRIGHT, BG);
+  tft.drawString("SPORTS DESK", 160, 80, 4);
+  tft.setTextColor(C_WHITE, BG);
+  tft.drawString(l1, 160, 130, 2);
+  tft.setTextColor(C_DIM, BG);
+  tft.drawString(l2, 160, 158, 2);
+  tft.setTextColor(C_DIM, BG);
+  tft.drawString("Hold 2s to force refresh", 160, 210, 1);
+}
+
+// ── Nav dots — 5 dots for 5 screens ──────────
+void drawNavDots(TFT_eSprite& s, int active) {
+  int cx = 160, y = 233;
+  for (int i = 0; i < 5; i++) {
+    int x = cx - 24 + (i * 12);
+    if (i == active) s.fillCircle(x, y, 4, C_BRIGHT);
+    else             s.drawCircle(x, y, 4, C_DIM);
+  }
+}
+
+// ══════════════════════════════════════════════
+//  FOOTBALL FETCH  ← ADDED
+// ══════════════════════════════════════════════
+
+// Try one competition. Returns true if ≥1 match found.
+bool fetchFootballComp(const char* compCode, const char* compName) {
+  WiFiClientSecure client;
+  client.setInsecure();   // skip cert validation — fine for IoT data
+  client.setTimeout(10);
+
+  HTTPClient http;
+  char url[160];
+  // Fetch today's matches: LIVE + scheduled/finished for today
+  snprintf(url, sizeof(url),
+    "https://api.football-data.org/v4/competitions/%s/matches?status=LIVE,IN_PLAY,PAUSED,SCHEDULED,TIMED,FINISHED",
+    compCode);
+
+  http.begin(client, url);
+  http.setTimeout(8000);
+  http.addHeader("X-Auth-Token", FOOTBALL_KEY);
+  int code = http.GET();
+
+  Serial.printf("[FB] %s HTTP %d\n", compCode, code);
+
+  if (code != 200) { http.end(); return false; }
+
+  // Read into shared buffer — no String allocation
+  int len = http.getStream().readBytes(httpBuf, HTTP_BUF - 1);
+  httpBuf[len] = '\0';
+  http.end();
+
+  // Parse with ArduinoJson filter — only extract what we need
+  StaticJsonDocument<128> filter;
+  filter["matches"][0]["homeTeam"]["shortName"]       = true;
+  filter["matches"][0]["awayTeam"]["shortName"]       = true;
+  filter["matches"][0]["score"]["fullTime"]["home"]   = true;
+  filter["matches"][0]["score"]["fullTime"]["away"]   = true;
+  filter["matches"][0]["status"]                      = true;
+  filter["matches"][0]["minute"]                      = true;
+  filter["matches"][0]["utcDate"]                     = true;
+
+  StaticJsonDocument<4096> doc;
+  DeserializationError err = deserializeJson(doc, httpBuf,
+                               DeserializationOption::Filter(filter));
+  if (err) {
+    Serial.printf("[FB] JSON error: %s\n", err.c_str());
+    return false;
+  }
+
+  JsonArray arr = doc["matches"].as<JsonArray>();
+  if (arr.isNull() || arr.size() == 0) return false;
+
+  fbMatchCount = 0;
+
+  // ── Pass 1: LIVE / IN_PLAY / PAUSED ──────────────────────
+  for (JsonObject m : arr) {
+    if (fbMatchCount >= FOOTBALL_MAX) break;
+    const char* st = m["status"] | "";
+    bool live = strcmp(st,"LIVE")==0 || strcmp(st,"IN_PLAY")==0 || strcmp(st,"PAUSED")==0;
+    if (!live) continue;
+
+    FootballMatch& fm = fbMatches[fbMatchCount++];
+    strncpy(fm.home, m["homeTeam"]["shortName"] | "???", 12); fm.home[12]='\0';
+    strncpy(fm.away, m["awayTeam"]["shortName"] | "???", 12); fm.away[12]='\0';
+    fm.homeScore  = m["score"]["fullTime"]["home"] | 0;
+    fm.awayScore  = m["score"]["fullTime"]["away"] | 0;
+    fm.isLive     = true;
+    fm.isFinished = false;
+    int minute = m["minute"] | 0;
+    if (strcmp(st,"PAUSED")==0)     snprintf(fm.status,sizeof(fm.status),"HT");
+    else if (minute > 0)            snprintf(fm.status,sizeof(fm.status),"%d'",minute);
+    else                            snprintf(fm.status,sizeof(fm.status),"LIVE");
+  }
+
+  // ── Pass 2: SCHEDULED / TIMED ────────────────────────────
+  for (JsonObject m : arr) {
+    if (fbMatchCount >= FOOTBALL_MAX) break;
+    const char* st = m["status"] | "";
+    if (strcmp(st,"SCHEDULED")!=0 && strcmp(st,"TIMED")!=0) continue;
+
+    FootballMatch& fm = fbMatches[fbMatchCount++];
+    strncpy(fm.home, m["homeTeam"]["shortName"] | "???", 12); fm.home[12]='\0';
+    strncpy(fm.away, m["awayTeam"]["shortName"] | "???", 12); fm.away[12]='\0';
+    fm.homeScore  = 0;
+    fm.awayScore  = 0;
+    fm.isLive     = false;
+    fm.isFinished = false;
+
+    // Extract HH:MM from utcDate and convert to IST (+5:30)
+    const char* utc = m["utcDate"] | "";
+    // utcDate format: "2025-06-18T15:00:00Z"
+    int h=0, mi=0;
+    if (strlen(utc) >= 16) {
+      h  = (utc[11]-'0')*10 + (utc[12]-'0');
+      mi = (utc[14]-'0')*10 + (utc[15]-'0');
+      mi += 30; if(mi>=60){ mi-=60; h++; }
+      h  +=  5; if(h >=24)  h -=24;
+    }
+    snprintf(fm.status, sizeof(fm.status), "%02d:%02d", h, mi);
+  }
+
+  // ── Pass 3: FINISHED ─────────────────────────────────────
+  for (JsonObject m : arr) {
+    if (fbMatchCount >= FOOTBALL_MAX) break;
+    const char* st = m["status"] | "";
+    if (strcmp(st,"FINISHED")!=0) continue;
+
+    FootballMatch& fm = fbMatches[fbMatchCount++];
+    strncpy(fm.home, m["homeTeam"]["shortName"] | "???", 12); fm.home[12]='\0';
+    strncpy(fm.away, m["awayTeam"]["shortName"] | "???", 12); fm.away[12]='\0';
+    fm.homeScore  = m["score"]["fullTime"]["home"] | 0;
+    fm.awayScore  = m["score"]["fullTime"]["away"] | 0;
+    fm.isLive     = false;
+    fm.isFinished = true;
+    snprintf(fm.status, sizeof(fm.status), "FT");
+  }
+
+  if (fbMatchCount > 0) {
+    strncpy(fbCompName, compName, sizeof(fbCompName)-1);
+    fbCompName[sizeof(fbCompName)-1] = '\0';
+    Serial.printf("[FB] %s: %d matches\n", compName, fbMatchCount);
+    return true;
+  }
+  return false;
+}
+
+void fetchFootball() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  Serial.println("[FB] Fetching...");
+  for (int i = 0; i < FB_COMP_CNT; i++) {
+    if (fetchFootballComp(FB_COMPS[i], FB_NAMES[i])) {
+      fbHasData = true;
+      lastFbFetch = millis();
+      return;
+    }
+  }
+  // All failed or no matches today
+  fbMatchCount = 0;
+  fbHasData = true;   // mark as attempted so we show "no matches" not "loading"
+  lastFbFetch = millis();
+  Serial.println("[FB] No matches found in any competition");
+}
+
+// ── SCREEN 0: Clock ───────────────────────────
+void drawClock(struct tm& t) {
+  drawGradientBG(sprite);
+
+  int LP=60, RP=68, RX=320-RP;
+  int CX=LP+(RX-LP)/2, CY=108;
+
+  sprite.drawFastVLine(LP, 0, 240, C_PURPLE);
+  sprite.drawFastVLine(RX, 0, 240, C_PURPLE);
+
+  // Days
+  const char* dayNames[]={"MON","TUE","WED","THU","FRI","SAT","SUN"};
+  int activeIdx=(t.tm_wday==0)?6:t.tm_wday-1;
+  int slotH=240/7;
+  for(int i=0;i<7;i++){
+    int yMid=i*slotH+slotH/2;
+    if(i==activeIdx){
+      sprite.fillRect(2,i*slotH+2,LP-4,slotH-4,tft.color565(80,0,30));
+      sprite.setTextColor(C_RED,tft.color565(80,0,30));
+    } else {
+      sprite.setTextColor(C_DIM,S_BG);
+    }
+    sprite.setTextDatum(MC_DATUM);
+    sprite.drawString(dayNames[i],LP/2,yMid,2);
+  }
+
+  // Right panel
+  int RC=RX+RP/2;
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString("DATE",RC,13,1);
+  char dayNum[4],monBuf[8],yrBuf[6];
+  strftime(dayNum,sizeof(dayNum),"%d",&t);
+  strftime(monBuf,sizeof(monBuf),"%b",&t);
+  strftime(yrBuf,sizeof(yrBuf),"%Y",&t);
+  sprite.setTextColor(C_ACCENT,S_BG);
+  sprite.drawString(dayNum,RC,35,4);
+  sprite.setTextColor(C_BRIGHT,S_BG);
+  sprite.drawString(monBuf,RC,60,2);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString(yrBuf,RC,77,1);
+  sprite.drawFastHLine(RX+5,92,RP-10,C_PURPLE);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString("WTHR",RC,103,1);
+  char tempStr[8];
+  sprintf(tempStr,"%.0f",w_temp);
+  sprite.setTextColor(weatherColor(),S_BG);
+  sprite.drawString(tempStr,RC,126,4);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString("oC",RC,112,1);
+  sprite.setTextColor(weatherColor(),S_BG);
+  sprite.drawString(weatherLabel().substring(0,4).c_str(),RC,150,1);
+  sprite.drawFastHLine(RX+5,160,RP-10,C_PURPLE);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString("KERALA",RC,174,1);
+  sprite.drawString("IST",RC,188,1);
+
+  // Time
+  colonAlpha+=colonDir;
+  if(colonAlpha<=0.1) colonDir=0.05;
+  if(colonAlpha>=1.0) colonDir=-0.05;
+  char timeBuf[8];
+  strftime(timeBuf,sizeof(timeBuf),colonAlpha>0.3?"%I:%M":"%I %M",&t);
+  glowPulse+=0.05; if(glowPulse>1.0) glowPulse=0.0;
+
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(blendColors(C_GLOW,BG,0.7),S_BG);
+  sprite.drawString(timeBuf,CX-2,CY+2,7);
+  sprite.drawString(timeBuf,CX+2,CY-2,7);
+  sprite.setTextColor(blendColors(C_PURPLE,BG,0.5),S_BG);
+  sprite.drawString(timeBuf,CX-1,CY+1,7);
+  sprite.drawString(timeBuf,CX+1,CY-1,7);
+  sprite.setTextColor(C_BRIGHT,S_BG);
+  sprite.drawString(timeBuf,CX,CY,7);
+
+  char ampm[4];
+  strftime(ampm,sizeof(ampm),"%p",&t);
+  sprite.setTextDatum(ML_DATUM);
+  sprite.setTextColor(blendColors(C_BRIGHT,C_PURPLE,0.3),S_BG);
+  sprite.drawString(ampm,CX+76,CY-32,2);
+
+  char secBuf[4];
+  strftime(secBuf,sizeof(secBuf),"%S",&t);
+  sprite.setTextDatum(MC_DATUM);
+  float breathe=0.7+0.3*sin(glowPulse*3.14159);
+  sprite.setTextColor(blendColors(C_WHITE,C_DIM,1.0-breathe),S_BG);
+  sprite.drawString(secBuf,CX,CY+50,4);
+  sprite.setTextColor(C_DIM,S_BG);
+  sprite.drawString("SEC",CX,CY+68,1);
+
+  // Progress bar
+  int barX=LP+8,barW=RX-LP-16,barY=218;
+  int filled=(t.tm_sec*barW)/60;
+  sprite.fillRoundRect(barX,barY,barW,5,2,blendColors(C_DIM,BG,0.5));
+  for(int i=0;i<filled;i++){
+    float ratio=(float)i/barW;
+    sprite.drawFastVLine(barX+i,barY,5,blendColors(C_ACCENT,C_BRIGHT,ratio));
+  }
+
+  drawNavDots(sprite, 0);
+  sprite.pushSprite(0,0);
+}
+
+// ══════════════════════════════════════════════
+//  SCREEN 1: FOOTBALL  ← FULLY IMPLEMENTED
+// ══════════════════════════════════════════════
+void drawFootball(struct tm& t) {
+  drawGradientBG(sprite);
+
+  // ── Header bar ───────────────────────────────────────────
+  sprite.fillRect(0, 0, 320, 28, tft.color565(10, 10, 35));
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(C_GREEN, tft.color565(10, 10, 35));
+  sprite.drawString(fbCompName, 160, 14, 2);
+  sprite.drawFastHLine(0, 28, 320, C_PURPLE);
+
+  // WiFi status indicator (top-right of header)
+  sprite.setTextDatum(MR_DATUM);
+  sprite.setTextColor(
+    WiFi.status()==WL_CONNECTED ? C_DIM : C_RED,
+    tft.color565(10,10,35));
+  sprite.drawString(WiFi.status()==WL_CONNECTED ? "W" : "!", 314, 14, 1);
+
+  // ── Loading / no data ────────────────────────────────────
+  if (!fbHasData) {
+    sprite.setTextDatum(MC_DATUM);
+    sprite.setTextColor(C_DIM, S_BG);
+    sprite.drawString("Fetching scores...", 160, 120, 2);
+    drawNavDots(sprite, 1);
+    sprite.pushSprite(0, 0);
+    return;
+  }
+
+  // ── No matches today ─────────────────────────────────────
+  if (fbMatchCount == 0) {
+    sprite.setTextDatum(MC_DATUM);
+    sprite.setTextColor(C_DIM, S_BG);
+    sprite.drawString("No matches today", 160, 100, 2);
+    char upd[24];
+    strftime(upd, sizeof(upd), "Checked %H:%M IST", &t);
+    sprite.setTextColor(C_DIM, S_BG);
+    sprite.drawString(upd, 160, 125, 1);
+    sprite.drawString("Next check in 5 min", 160, 145, 1);
+    drawNavDots(sprite, 1);
+    sprite.pushSprite(0, 0);
+    return;
+  }
+
+  // ── Match rows ───────────────────────────────────────────
+  // Available vertical space: y=30 to y=220 = 190px
+  // Divide evenly among matches (max 4)
+  int yTop  = 30;
+  int yBot  = 220;
+  int space = yBot - yTop;
+  int rowH  = space / fbMatchCount;   // e.g. 4 matches → 47px each
+
+  for (int i = 0; i < fbMatchCount; i++) {
+    FootballMatch& m = fbMatches[i];
+    int yRow  = yTop + i * rowH;
+    int yCent = yRow + rowH / 2;       // vertical centre of this row
+
+    // ── Live indicator: green left strip ──────────────────
+    if (m.isLive) {
+      sprite.fillRect(0, yRow + 2, 4, rowH - 4, C_GREEN);
+    }
+
+    // ── Home team (left-aligned, x=8) ────────────────────
+    sprite.setTextDatum(ML_DATUM);
+    sprite.setTextColor(C_WHITE, S_BG);
+    sprite.drawString(m.home, 8, yCent - 7, 2);
+
+    // ── Away team (right-aligned, x=312) ─────────────────
+    sprite.setTextDatum(MR_DATUM);
+    sprite.setTextColor(C_WHITE, S_BG);
+    sprite.drawString(m.away, 312, yCent - 7, 2);
+
+    // ── Centre: score or "vs" ─────────────────────────────
+    sprite.setTextDatum(MC_DATUM);
+    if (m.isLive || m.isFinished) {
+      // Show score
+      char score[6];
+      snprintf(score, sizeof(score), "%d - %d", m.homeScore, m.awayScore);
+      sprite.setTextColor(m.isLive ? C_YELLOW : C_WHITE, S_BG);
+      sprite.drawString(score, 160, yCent - 7, 2);
+    } else {
+      // Upcoming: show "vs"
+      sprite.setTextColor(C_DIM, S_BG);
+      sprite.drawString("vs", 160, yCent - 7, 2);
+    }
+
+    // ── Status tag below score ────────────────────────────
+    uint16_t stCol;
+    if      (m.isLive)      stCol = C_GREEN;
+    else if (m.isFinished)  stCol = C_DIM;
+    else                    stCol = C_ACCENT;   // upcoming time in blue
+
+    sprite.setTextColor(stCol, S_BG);
+    sprite.drawString(m.status, 160, yCent + 10, 1);
+
+    // ── Row divider (not after last row) ─────────────────
+    if (i < fbMatchCount - 1) {
+      sprite.drawFastHLine(6, yRow + rowH - 1, 308,
+                           tft.color565(35, 35, 55));
+    }
+  }
+
+  // ── Footer: last updated ─────────────────────────────────
+  char upd[24];
+  strftime(upd, sizeof(upd), "Updated %H:%M IST", &t);
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(C_DIM, S_BG);
+  sprite.drawString(upd, 160, 224, 1);
+
+  drawNavDots(sprite, 1);
+  sprite.pushSprite(0, 0);
+}
+
+// ── SCREEN 2: F1 Live (stub — next phase) ─────
+
+void fetchF1Live() {
+
+  const char* drv[20] = {
+    "VER","NOR","PIA","LEC","RUS",
+    "HAM","ALO","SAI","ALB","GAS",
+    "TSU","HUL","OCO","STR","LAW",
+    "BEA","BOR","ANT","COL","HAD"
+  };
+
+  const char* gap[20] = {
+    "+0.000","+1.234","+3.456","+6.782","+8.911",
+    "+12.4","+15.8","+19.2","+23.1","+27.5",
+    "+31.2","+35.4","+39.7","+44.1","+48.8",
+    "+52.3","+57.0","+61.5","+67.2","+73.1"
+  };
+
+  for(int i=0;i<20;i++){
+    liveDriver[i]=drv[i];
+    liveGap[i]=gap[i];
+  }
+}
+void fetchF1Standings() {
+
+  HTTPClient http;
+
+  http.begin("https://api.jolpi.ca/ergast/f1/current/driverstandings.json");
+
+  int httpCode = http.GET();
+
+  if (httpCode == 200) {
+
+    String payload = http.getString();
+
+    DynamicJsonDocument doc(50000);
+
+    deserializeJson(doc, payload);
+
+    JsonArray standings =
+      doc["MRData"]["StandingsTable"]
+         ["StandingsLists"][0]
+         ["DriverStandings"];
+
+    for (int i = 0; i < 5; i++) {
+
+      f1Driver[i] =
+        standings[i]["Driver"]["code"]
+          .as<String>();
+
+      f1Points[i] =
+        standings[i]["points"]
+          .as<int>();
+    }
+  }
+
+  http.end();
+}
+void drawF1Live(struct tm& t) {
+
+  static unsigned long lastPage = 0;
+  static int page = 0;
+
+  if (millis() - lastPage > 2000) {
+    page = (page + 1) % 4;
+    lastPage = millis();
+  }
+
+  const char* drv[20] = {
+    "VER","NOR","PIA","LEC","RUS",
+    "HAM","ALO","SAI","ALB","GAS",
+    "TSU","HUL","OCO","STR","LAW",
+    "BEA","BOR","ANT","COL","HAD"
+  };
+
+  const char* gap[20] = {
+    "+0.000","+1.234","+3.456","+6.782","+8.911",
+    "+12.4","+15.8","+19.2","+23.1","+27.5",
+    "+31.2","+35.4","+39.7","+44.1","+48.8",
+    "+52.3","+57.0","+61.5","+67.2","+73.1"
+  };
+
+  sprite.fillSprite(TFT_BLACK);
+
+  sprite.setTextDatum(TL_DATUM);
+
+  sprite.setTextColor(TFT_RED, TFT_BLACK);
+  sprite.drawString("FORMULA 1 LIVE", 10, 8, 2);
+
+  sprite.drawFastHLine(0, 30, 320, TFT_RED);
+
+  int start = page * 5;
+
+  sprite.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  for(int i=0;i<5;i++) {
+
+    int idx = start + i;
+
+    String row =
+      "P" + String(idx + 1) +
+      " " + liveDriver[idx] +
+      " " + liveGap[idx];
+
+    sprite.drawString(
+      row,
+      15,
+      50 + i * 32,
+      2
+    );
+  }
+
+  sprite.drawFastHLine(0, 210, 320, TFT_DARKGREY);
+
+  sprite.setTextColor(TFT_GREEN, TFT_BLACK);
+  sprite.drawString("LAP " + String(currentLap) + " / " + String(totalLaps), 10, 220, 2);
+
+  drawNavDots(sprite, 2);
+
+  sprite.pushSprite(0,0);
+}
+// ── SCREEN 3: F1 Standings ────────────────────
+void drawF1Standings(struct tm& t) {
+  sprite.fillSprite(TFT_BLACK);
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextColor(C_YELLOW, TFT_BLACK);
+  sprite.drawString("F1 STANDINGS", 10, 10, 2);
+  sprite.drawFastHLine(0, 35, 320, C_PURPLE);
+  sprite.setTextColor(C_WHITE, TFT_BLACK);
+  for (int i = 0; i < 5; i++) {
+    String row = String(i+1) + ". " + f1Driver[i];
+    sprite.drawString(row, 20, 55+(i*30), 2);
+    sprite.drawRightString(String(f1Points[i]), 300, 55+(i*30), 2);
+  }
+  drawNavDots(sprite, 3);
+  sprite.pushSprite(0, 0);
+}
+
+// ── SCREEN 4: Sports News (stub) ──────────────
+void drawSportsNews(struct tm& t) {
+  sprite.fillSprite(TFT_BLACK);
+  drawGradientBG(sprite);
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(C_ACCENT, S_BG);
+  sprite.drawString("SPORTS NEWS", 160, 40, 4);
+  sprite.setTextColor(C_DIM, S_BG);
+  sprite.drawString("COMING SOON", 160, 150, 2);
+  drawNavDots(sprite, 4);
+  sprite.pushSprite(0, 0);
+}
+
+// ── F1 standings fetch (your existing) ────────
+ 
+
+// ── Button: long press detection ──────────────
+enum BtnState { BS_IDLE, BS_PRESSED, BS_LONG_SENT };
+BtnState bState = BS_IDLE;
+bool bLastRaw = HIGH;
+uint32_t bPressT = 0;
+#define BTN_LONG_MS 2000
+
+typedef enum {
+  BTN_NONE,
+  BTN_SINGLE,
+  BTN_LONG
+} BtnEvent;
+
+int getButtonEvent() {
+
+  bool raw = digitalRead(21);
+  uint32_t now = millis();
+
+  int ev = BTN_NONE;
+
+  switch (bState) {
+
+    case BS_IDLE:
+      if (raw == LOW && bLastRaw == HIGH) {
+        bPressT = now;
+        bState = BS_PRESSED;
+      }
+      break;
+
+    case BS_PRESSED:
+      if (raw == HIGH) {
+        if (now - bPressT >= 50 &&
+            now - bPressT < BTN_LONG_MS)
+          ev = BTN_SINGLE;
+
+        bState = BS_IDLE;
+      }
+      else if (now - bPressT >= BTN_LONG_MS) {
+        ev = BTN_LONG;
+        bState = BS_LONG_SENT;
+      }
+      break;
+
+    case BS_LONG_SENT:
+      if (raw == HIGH)
+        bState = BS_IDLE;
+      break;
+  }
+
+  bLastRaw = raw;
+  return ev;
+}
+// ── Setup ─────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  pinMode(21, INPUT_PULLUP);
+  delay(1000);
+
+  tft.init();
+  tft.setRotation(3);
+  tft.invertDisplay(false);
+  tft.fillScreen(BG);
+  initColors();
+
+  sprite.setColorDepth(16);
+  sprite.createSprite(320, 240);
+
+  showSplash("Connecting to WiFi...", ssid);
+  WiFi.begin(ssid, password);
+  int a = 0;
+  while (WiFi.status() != WL_CONNECTED && a < 30) { delay(500); a++; }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    showSplash("Syncing NTP time...", "pool.ntp.org");
+    configTime(gmtOffset_sec, daylightOffset, ntpServer);
+    struct tm ti; int tr = 0;
+    while (!getLocalTime(&ti) && tr < 20) { delay(500); tr++; }
+
+    showSplash("Fetching weather...", "Thrissur, Kerala");
+    fetchWeather();
+    lastWeatherFetch = millis();
+
+    showSplash("Loading F1 standings...", "api.jolpi.ca");
+   fetchF1Standings();
+   fetchF1Live();
+    fetchF1Live();
+    lastF1Fetch = millis();
+
+    showSplash("Loading football scores...", "football-data.org");
+    fetchFootball();
+
+  } else {
+    showSplash("WiFi Failed!", "Check credentials");
+    delay(3000);
+  }
+
+  tft.fillScreen(BG);
+}
+
+// ── Loop ──────────────────────────────────────
+void loop() {
+  struct tm t;
+  if (!getLocalTime(&t)) { delay(50); return; }
+
+  uint32_t now = millis();
+
+  // ── Button ──────────────────────────────────
+  int ev = getButtonEvent();
+
+  if (ev == BTN_SINGLE) {
+    currentScreen = (currentScreen + 1) % 5;
+    Serial.printf("[BTN] Screen -> %d\n", currentScreen);
+    sprite.fillSprite(TFT_BLACK);
+    tft.fillScreen(TFT_BLACK);
+  }
+
+  // Long press = force refresh current screen
+  if (ev == BTN_LONG) {
+    Serial.printf("[BTN] Long press on screen %d\n", currentScreen);
+    sprite.fillSprite(TFT_BLACK);
+    tft.fillScreen(TFT_BLACK);
+    switch (currentScreen) {
+      case 0: fetchWeather();      lastWeatherFetch = now; break;
+      case 1: fetchFootball();                             break;
+      case 3: fetchF1Standings();  lastF1Fetch      = now; break;
+    }
+  }
+
+  // ── Timed refreshes ─────────────────────────
+
+  // Clock weather (10 min)
+  if (now - lastWeatherFetch > WEATHER_INTERVAL) {
+    lastWeatherFetch = now;
+    fetchWeather();
+  }
+
+  // Football: 60s if live match, 5 min otherwise
+  {
+    bool anyLive = false;
+    for (int i = 0; i < fbMatchCount; i++) if (fbMatches[i].isLive) { anyLive=true; break; }
+    uint32_t fbInt = anyLive ? FB_INTERVAL_LIVE : FB_INTERVAL_IDLE;
+    if (now - lastFbFetch > fbInt) fetchFootball();
+  }
+
+  // F1 standings (30 min — was 10s before, fixed)
+  if (now - lastF1Fetch > 1800000UL) {
+    lastF1Fetch = now;
+   fetchF1Standings();
+  }
+
+  // ── Draw ────────────────────────────────────
+  switch (currentScreen) {
+    case 0: drawClock(t);       break;
+    case 1: drawFootball(t);    break;
+    case 2: drawF1Live(t);      break;
+    case 3: drawF1Standings(t); break;
+    case 4: drawSportsNews(t);  break;
+  }
+
+  delay(50);
+}
