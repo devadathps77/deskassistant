@@ -570,6 +570,8 @@ void drawFootball(struct tm& t) {
 
 void fetchF1Live() {
 
+Serial.println("=== FETCHING OPENF1 ===");
+
   HTTPClient http;
 
   http.begin("https://api.openf1.org/v1/drivers?session_key=latest");
@@ -585,24 +587,28 @@ void fetchF1Live() {
 
     Serial.println("OpenF1 Connected");
 
-    // TEMPORARY TEST
-   const char* drv[20] = {
-  "VER","NOR","PIA","LEC","RUS",
-  "HAM","ALO","SAI","ALB","GAS",
-  "TSU","HUL","OCO","STR","LAW",
-  "BEA","BOR","ANT","COL","HAD"
-};
+DynamicJsonDocument doc(40000);
 
-const char* gap[20] = {
-  "+0.000","+1.234","+3.456","+6.782","+8.911",
-  "+12.4","+15.8","+19.2","+23.1","+27.5",
-  "+31.2","+35.4","+39.7","+44.1","+48.8",
-  "+52.3","+57.0","+61.5","+67.2","+73.1"
-};
+DeserializationError error =
+  deserializeJson(doc, payload);
 
-for(int i=0;i<20;i++){
-  liveDriver[i] = drv[i];
-  liveGap[i] = gap[i];
+if(error){
+  Serial.println("OpenF1 JSON Error");
+  return;
+}
+
+JsonArray drivers = doc.as<JsonArray>();
+
+int count = min((int)drivers.size(), 20);
+Serial.print("Drivers Found: ");
+Serial.println(count);
+for(int i = 0; i < count; i++){
+
+  liveDriver[i] =
+    drivers[i]["name_acronym"]
+      .as<String>();
+
+  liveGap[i] = "---";
 }
 
     liveStatus = "CONNECTED";
@@ -833,7 +839,6 @@ void setup() {
     showSplash("Loading F1 standings...", "api.jolpi.ca");
    fetchF1Standings();
    fetchF1Live();
-    fetchF1Live();
     lastF1Fetch = millis();
 
     showSplash("Loading football scores...", "football-data.org");
@@ -849,6 +854,11 @@ void setup() {
 
 // ── Loop ──────────────────────────────────────
 void loop() {
+  static unsigned long dbg=0;
+if(millis()-dbg>5000){
+  dbg=millis();
+  Serial.println("Loop Running");
+}
   struct tm t;
   if (!getLocalTime(&t)) { delay(50); return; }
 
@@ -897,6 +907,7 @@ void loop() {
     lastF1Fetch = now;
    fetchF1Standings();
   }
+
 
   // ── Draw ────────────────────────────────────
   switch (currentScreen) {
